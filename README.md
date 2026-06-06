@@ -1,86 +1,124 @@
 # oxide-tenancy
 
-GPU infrastructure crate from the SuperInstance ecosystem.
-
-## Overview
-
-# oxide-tenancy
-
 Multi-tenant GPU isolation with ternary quality signals.
+
+## Why This Exists
+
+When multiple tenants share a GPU — different teams, different workloads, different SLAs — you can't just hand out time slices and hope for the best. GPUs have shared memory bandwidth, shared L2 cache, shared SM schedulers. One tenant's memory-hungry kernel can degrade another's latency by 40% without either exceeding its nominal allocation.
+
+The core insight: isolation quality is not binary. A tenant can be **fully isolated** (+1), **cooperatively sharing** (0), or **actively interfering** (-1). This ternary signal drives every decision — allocation, quarantine, rebalancing — without needing exact interference measurements (which are expensive and often unavailable on real hardware).
 
 ## Architecture
 
-This crate sits within the **five-layer Oxide Stack**:
-
-| Layer | Crate | Role |
-|-------|-------|------|
-| 1 | open-parallel | Async runtime (tokio fork) |
-| 2 | pincher | "Vector DB as runtime, LLM as compiler" |
-| 3 | flux-core | Bytecode VM + A2A agent protocol |
-| 4 | cuda-oxide | Flux→MIR→Pliron→NVVM→PTX compiler |
-| 5 | cudaclaw | Persistent GPU kernels, warp consensus, SmartCRDT |
-
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
-
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 11 |
-| Lines of Code | 361 |
-| Public API Surface | 21 items |
-| License | Apache-2.0 |
-
-## Installation
-
-```toml
-[dependencies]
-oxide-tenancy = "0.1.0"
 ```
+┌─────────────────────────────────────────────────┐
+│                TenancyManager                    │
+│  total_resources: f64 (e.g. 100.0 = 100%)       │
+│                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
+│  │ Tenant A │  │ Tenant B │  │ Tenant C │      │
+│  │ weight=3 │  │ weight=1 │  │ weight=2 │      │
+│  │ quota=40 │  │ quota=30 │  │ quota=50 │      │
+│  │ quality  │  │ quality  │  │ quality  │      │
+│  │ =Shared  │  │ =Isolat. │  │ =Interf. │      │
+│  └──────────┘  └──────────┘  └──────────┘      │
+│                                                  │
+│  fair_share_allocate() ──→ HashMap<id, units>    │
+│  detect_interference()  ──→ Vec<offender ids>    │
+│  quarantine(id)         ──→ remove from pool     │
+│  rebalance()            ──→ reallocate + update  │
+└─────────────────────────────────────────────────┘
+```
+
+**Key types:**
+
+- `IsolationQuality` — ternary enum: `Isolated(+1)`, `Shared(0)`, `Interference(-1)`
+- `Tenant` — weight, quota, current usage, quality signal, quarantine flag
+- `TenancyManager` — the allocation engine: fair-share with quota caps and surplus redistribution
+
+**Data flow:** Tenants register → manager computes proportional shares → quota caps applied → surplus redistributed → interference detected → offenders quarantined → pool shrinks → rebalance.
 
 ## Usage
 
 ```rust
-use oxide_tenancy::*;
-// See src/lib.rs tests for complete working examples
+use oxide_tenancy::{TenancyManager, Tenant, IsolationQuality};
+
+let mut mgr = TenancyManager::new(100.0); // 100 GPU units total
+
+mgr.add_tenant(Tenant::new("training", 3.0, 60.0));  // 60% max, weight 3
+mgr.add_tenant(Tenant::new("inference", 1.0, 30.0)); // 30% max, weight 1
+mgr.add_tenant(Tenant::new("analytics", 1.0, 40.0)); // 40% max, weight 1
+
+// Fair-share allocation: training gets ~60, inference ~20, analytics ~20
+let alloc = mgr.fair_share_allocate();
+assert!((alloc["training"] - 60.0).abs() < 1e-6); // capped at quota
+assert!((alloc["inference"] - 20.0).abs() < 1e-6);
+
+// Detect interference and quarantine
+let noisy = mgr.detect_interference(); // returns tenants with quality == Interference
+for id in &noisy {
+    mgr.quarantine(id); // removes from allocation pool
+}
+
+// Rebalance after changes
+mgr.update_weight("inference", 2.0);
+let new_alloc = mgr.rebalance();
 ```
 
-### Key Types
+## API Reference
 
-```
-- pub enum IsolationQuality {
-    pub fn from_i8(v: i8) -> Option<Self> {
-- pub struct Tenant {
-    pub fn new(id: impl Into<String>, weight: f64, quota: f64) -> Self {
-    pub fn proportional_share(&self, total_weight: f64, total_resources: f64) -> f64 {
-    pub fn is_over_quota(&self) -> bool {
-- pub struct TenancyManager {
-    pub fn new(total_resources: f64) -> Self {
-    pub fn add_tenant(&mut self, tenant: Tenant) {
-    pub fn remove_tenant(&mut self, id: &str) -> Option<Tenant> {
+### `IsolationQuality`
+
+```rust
+pub enum IsolationQuality {
+    Isolated = 1,    // Full isolation, no cross-tenant effects
+    Shared = 0,      // Cooperative sharing
+    Interference = -1, // Causing or experiencing interference
+}
 ```
 
-## Design Philosophy
+- `from_i8(v: i8) -> Option<Self>` — convert from numeric ternary value
 
-This crate uses **ternary algebra** (Z₃) where every value is {-1, 0, +1}:
+### `Tenant`
 
-- **+1** → positive signal (healthy, allocated, converged, ready)
-- **0** → neutral (pending, balanced, monitoring, degraded)
-- **-1** → negative signal (failed, free, diverged, overloaded)
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary neural networks at 60% less power
-2. **GPU warp voting** — hardware ballot instructions return ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity (what goes in must come out)
-
-## Testing
-
-```bash
-git clone https://github.com/SuperInstance/oxide-tenancy.git
-cd oxide-tenancy
-cargo test
+```rust
+pub struct Tenant {
+    pub id: String,
+    pub weight: f64,       // Fair-share weight (must be > 0)
+    pub quota: f64,        // Hard cap in GPU units
+    pub usage: f64,        // Current resource consumption
+    pub quality: IsolationQuality,
+    pub quarantined: bool,
+}
 ```
 
-## License
+- `new(id, weight, quota) -> Self`
+- `proportional_share(total_weight, total_resources) -> f64` — weight-proportional allocation
+- `is_over_quota() -> bool` — usage exceeds quota
 
-Apache-2.0
+### `TenancyManager`
+
+- `new(total_resources: f64) -> Self`
+- `add_tenant(tenant: Tenant)` — register a tenant
+- `remove_tenant(id: &str) -> Option<Tenant>`
+- `get_tenant(id: &str) -> Option<&Tenant>` / `get_tenant_mut(id: &str) -> Option<&mut Tenant>`
+- `tenant_ids() -> Vec<String>` / `tenant_count() -> usize`
+- `fair_share_allocate() -> HashMap<String, f64>` — proportional allocation with quota caps and surplus redistribution
+- `detect_interference() -> Vec<String>` — tenants with `Interference` quality
+- `quarantine(id: &str) -> bool` / `release_quarantine(id: &str) -> bool`
+- `rebalance() -> HashMap<String, f64>` — recompute allocations and update usage
+- `update_weight(id: &str, new_weight: f64) -> bool`
+- `over_quota_tenants() -> Vec<String>`
+
+## The Deeper Idea
+
+This is the **multi-tenancy layer** in the oxide stack's resource management architecture. The ternary isolation signal (`Isolated`/`Shared`/`Interference`) is the same {-1, 0, +1} pattern used throughout the ecosystem — in health monitoring, capacity planning, and load shedding. The shared vocabulary means a tenancy interference event can cascade into a capacity scale-up or a load-shed decision without protocol translation.
+
+The fair-share algorithm does two passes: first allocate `min(proportional_share, quota)`, then redistribute any surplus from over-quota tenants back to those with headroom. This avoids the classic problem where strict proportional allocation wastes resources when a high-weight tenant has a low quota.
+
+## Related Crates
+
+- **oxide-capacity** — cluster-level capacity planning that consumes tenancy allocation data
+- **oxide-health-monitor** — GPU health signals that feed into tenant quality classification
+- **oxide-lease-grid** — spatial resource allocation (which GPUs, not how much)
+- **oxide-loadshed** — when tenancy allocation can't help and jobs must be shed
