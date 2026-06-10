@@ -1,4 +1,6 @@
 [package]
+description = "oxide-tenancy - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/oxide-tenancy"
 name = "oxide-tenancy"
 version = "0.1.0"
 edition = "2021"
